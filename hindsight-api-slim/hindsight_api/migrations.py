@@ -31,6 +31,7 @@ from alembic.config import Config
 from alembic.script.revision import ResolutionError
 from alembic.util.exc import CommandError
 from sqlalchemy import Connection, create_engine, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
 from ._pg_extensions import (
@@ -637,6 +638,37 @@ def _drop_embedding_vector_indexes(conn: Connection, schema_name: str, table_nam
         _drop_index(conn, schema_name, index_name)
 
 
+def _count_embedded_rows(conn: Connection, schema_name: str, table_name: str) -> int:
+    """Count rows with an embedding, tolerating a damaged heap page.
+
+    Startup only needs to know whether the table holds data and roughly how much.
+    An exact COUNT(*) reads every page, so one unreadable page (e.g. a checksum
+    failure) would otherwise abort startup. On a database error, fall back to the
+    planner estimate, treating "unknown" as "has data" so a damaged table is never
+    mistaken for an empty one and re-indexed or re-dimensioned.
+    """
+    try:
+        with conn.begin_nested():
+            return conn.execute(
+                text(f"SELECT COUNT(*) FROM {schema_name}.{table_name} WHERE embedding IS NOT NULL")
+            ).scalar()
+    except DBAPIError as exc:
+        estimate = conn.execute(
+            text("SELECT c.reltuples::bigint FROM pg_class c WHERE c.oid = CAST(:rel AS regclass)"),
+            {"rel": f"{schema_name}.{table_name}"},
+        ).scalar()
+        row_count = max(int(estimate or 0), 1)
+        logger.error(
+            "Exact embedding row count failed for %s.%s (%s); continuing with estimate %d. "
+            "The table may contain damaged pages: run pg_amcheck or pg_checksums.",
+            schema_name,
+            table_name,
+            type(exc.orig).__name__ if exc.orig is not None else type(exc).__name__,
+            row_count,
+        )
+        return row_count
+
+
 def _migrate_table_embedding_dimension(
     conn: Connection,
     schema_name: str,
@@ -687,9 +719,7 @@ def _migrate_table_embedding_dimension(
         f"Embedding dimension mismatch on {table_name}: database has {current_dim}, model requires {required_dimension}"
     )
 
-    row_count = conn.execute(
-        text(f"SELECT COUNT(*) FROM {schema_name}.{table_name} WHERE embedding IS NOT NULL")
-    ).scalar()
+    row_count = _count_embedded_rows(conn, schema_name, table_name)
 
     if row_count > 0:
         raise RuntimeError(
@@ -821,9 +851,7 @@ def ensure_embedding_dimension(
             # the right dimension but no index (the store-owned branch above dropped it). Without
             # this the resize path is the only thing that ever builds it, and a matching dimension
             # never resizes — every page search would seq-scan until the model changed.
-            row_count = conn.execute(
-                text(f"SELECT COUNT(*) FROM {schema_name}.mental_models WHERE embedding IS NOT NULL")
-            ).scalar()
+            row_count = _count_embedded_rows(conn, schema_name, "mental_models")
             _create_embedding_vector_index(
                 conn, schema_name, "mental_models", required_dimension, vector_ext, row_count
             )
@@ -897,9 +925,7 @@ def ensure_vector_extension(
                 logger.debug(f"Table {table_name} does not exist in schema '{schema_name}', skipping")
                 continue
 
-            row_count = conn.execute(
-                text(f"SELECT COUNT(*) FROM {schema_name}.{table_name} WHERE embedding IS NOT NULL")
-            ).scalar()
+            row_count = _count_embedded_rows(conn, schema_name, table_name)
 
             # Check current index type by querying pg_indexes
             current_index_rows = conn.execute(
